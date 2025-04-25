@@ -11,9 +11,15 @@ include_directories(
 
 add_subdirectory(src/reduce)
 add_subdirectory(src/histogram)
+add_subdirectory(src/sgemm)
 
-add_executable(test_reduce test/test_reduce_main.cpp)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test)
+
+add_executable(test_reduce test/test_reduce.cpp)
 target_link_libraries(test_reduce reduce)
 
-add_executable(test_histogram test/test_histogram_main.cpp)
+add_executable(test_histogram test/test_histogram.cpp)
 target_link_libraries(test_histogram histogram)
+
+add_executable(test_sgemm test/test_sgemm.cpp)
+target_link_libraries(test_sgemm sgemm)
