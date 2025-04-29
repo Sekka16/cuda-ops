@@ -38,7 +38,7 @@ __global__ void block_all_reduce_sum_f32_f32_kernel(const float* input, float* o
     if (tid == 0) atomicAdd(output, sum);
 }
 
-template<const int COARSENING = 4, const int NUM_THREADS = 256 / COARSENING>
+template<const int COARSENING = 2, const int NUM_THREADS = 256>
 __global__ void block_all_reduce_sum_f32_coarsened_kernel(const float* input, float* output, int N) {
     int tid = threadIdx.x;
     int idx = (blockDim.x * blockIdx.x + tid) * COARSENING;
@@ -70,14 +70,13 @@ __global__ void block_all_reduce_sum_f32_coarsened_kernel(const float* input, fl
 }
 
 void reduce_sum_launcher(const float* x, float* out, int N, bool use_coarsening) {
+    int block_size = 256;
+    int grid_size = (N + block_size - 1) / block_size;
+
     if (use_coarsening) {
-        constexpr int COARSENING = 4;
-        constexpr int THREADS = 256 / COARSENING;
-        int blocks = (N + (THREADS * COARSENING - 1)) / (THREADS * COARSENING);
-        block_all_reduce_sum_f32_coarsened_kernel<COARSENING, THREADS><<<blocks, THREADS>>>(x, out, N);
+        grid_size = (grid_size / 2) == 0 ? 1 : grid_size / 2;
+        block_all_reduce_sum_f32_coarsened_kernel<2><<<grid_size, block_size>>>(x, out, N);
     } else {
-        constexpr int THREADS = 256;
-        int blocks = (N + THREADS - 1) / THREADS;
-        block_all_reduce_sum_f32_f32_kernel<THREADS><<<blocks, THREADS>>>(x, out, N);
+        block_all_reduce_sum_f32_f32_kernel<256><<<grid_size, block_size>>>(x, out, N);
     }
 }
