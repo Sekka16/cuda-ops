@@ -3,94 +3,17 @@
 #include <vector>
 #include <cmath>
 #include <chrono>
+#include "../src/sgemm/sgemm.cuh"
+#include "../src/sgemm/sgemm.cu"
 
 #define CHECK_CUDA(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            std::cerr << "CUDA error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << "\n"; \
-            exit(EXIT_FAILURE); \
-        } \
-    } while (0)
-
-template <
-    const int SRAM_M,
-    const int SRAM_N,
-    const int SRAM_K,
-    const int REG_M,
-    const int REG_N,
-    const int REG_K
->
-__global__ void sgemm_reg_f32_kernel(float* a, float* b, float* c, int M, int N, int K) {
-    __shared__ float smem_a[SRAM_M][SRAM_K];
-    __shared__ float smem_b[SRAM_K][SRAM_N];
-
-    float reg_c[REG_M][REG_N] = {0};
-
-    int bx = blockIdx.x, by = blockIdx.y;
-    int tx = threadIdx.x, ty = threadIdx.y;
-
-    int tid = ty * blockDim.x + tx;
-    int threads_per_block = blockDim.x * blockDim.y;
-
-    for (int k0 = 0; k0 < K; k0 += SRAM_K) {
-        for (int i = tid; i < SRAM_M * SRAM_K; i += threads_per_block) {
-            int row = i / SRAM_K;
-            int col = i % SRAM_K;
-            int g_row = by * SRAM_M + row;
-            int g_col = k0 + col;
-            smem_a[row][col] = (g_row < M && g_col < K) ? a[g_row * K + g_col] : 0.0f;
-        }
-
-        for (int i = tid; i < SRAM_K * SRAM_N; i += threads_per_block) {
-            int row = i / SRAM_N;
-            int col = i % SRAM_N;
-            int g_row = k0 + row;
-            int g_col = bx * SRAM_N + col;
-            smem_b[row][col] = (g_row < K && g_col < N) ? b[g_row * N + g_col] : 0.0f;
-        }
-
-        __syncthreads();
-
-        for (int kk = 0; kk < SRAM_K; kk += REG_K) {
-            float reg_a[REG_M][REG_K];
-            float reg_b[REG_K][REG_N];
-
-            for (int m = 0; m < REG_M; ++m) {
-                int row = ty * REG_M + m;
-                for (int k = 0; k < REG_K; ++k) {
-                    int col = kk + k;
-                    reg_a[m][k] = (row < SRAM_M && col < SRAM_K) ? smem_a[row][col] : 0.0f;
-                }
-            }
-
-            for (int k = 0; k < REG_K; ++k) {
-                int row = kk + k;
-                for (int n = 0; n < REG_N; ++n) {
-                    int col = tx * REG_N + n;
-                    reg_b[k][n] = (row < SRAM_K && col < SRAM_N) ? smem_b[row][col] : 0.0f;
-                }
-            }
-
-            for (int m = 0; m < REG_M; ++m)
-                for (int n = 0; n < REG_N; ++n)
-                    for (int k = 0; k < REG_K; ++k)
-                        reg_c[m][n] += reg_a[m][k] * reg_b[k][n];
-        }
-
-        __syncthreads();
-    }
-
-    for (int m = 0; m < REG_M; ++m) {
-        int g_row = by * SRAM_M + ty * REG_M + m;
-        if (g_row >= M) continue;
-        for (int n = 0; n < REG_N; ++n) {
-            int g_col = bx * SRAM_N + tx * REG_N + n;
-            if (g_col >= N) continue;
-            c[g_row * N + g_col] = reg_c[m][n];
-        }
-    }
-}
+do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        std::cerr << "CUDA error: " << cudaGetErrorString(err) << " at " << __FILE__ << ":" << __LINE__ << "\n"; \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
 
 // Simple CPU GEMM for validation
 void cpu_gemm(const float* A, const float* B, float* C, int M, int N, int K) {

@@ -1,4 +1,4 @@
-#include "sgemm.h"
+#include "sgemm.cuh"
 
 __global__ void sgemm_naive_f32_kernel(float* a, float* b, float* c, int M, int N, int K) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -166,11 +166,4 @@ __global__ void sgemm_reg_f32_kernel(float* a, float* b, float* c, int M, int N,
             c[global_row * N + global_col] = reg_c[m][n];
         }
     }
-}
-
-void sgemm_launcher(float* a, float* b, float* c, int M, int N, int K) {
-    dim3 block(16, 16);
-    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
-
-    sgemm_naive_f32_kernel<<<grid, block>>>(a, b, c, M, N, K);
 }
