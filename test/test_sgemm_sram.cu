@@ -85,13 +85,13 @@ void compare(float* ref, float* gpu, int M, int N) {
 }
 
 int main() {
-    constexpr int M = 128;
-    constexpr int N = 128;
-    constexpr int K = 128;
+    constexpr int M = 1024;
+    constexpr int N = 1024;
+    constexpr int K = 1024;
 
-    constexpr int TILE_M = 8;
-    constexpr int TILE_N = 8;
-    constexpr int TILE_K = 8;
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    constexpr int TILE_K = 16;
 
     size_t size_a = M * K * sizeof(float);
     size_t size_b = K * N * sizeof(float);
