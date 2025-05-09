@@ -1,10 +1,8 @@
 #include <cuda_runtime.h>
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <chrono>
-#include <algorithm>
+#include <bits/stdc++.h>
 #include "../src/sgemm/sgemm.cuh"
+
+#define FLOAT4(value) (reinterpret_cast<float4 *>(&(value))[0])
 
 #define CHECK_CUDA(call)                                                                                             \
 do                                                                                                               \
@@ -129,8 +127,26 @@ int main()
         dim3 block_threads(SRAM_N / REG_N, SRAM_M / REG_M); 
         dim3 grid_blocks((N + SRAM_N - 1) / SRAM_N, (M + SRAM_M - 1) / SRAM_M);
 
-        test_kernel(sgemm_reg_f32_kernel<SRAM_M, SRAM_N, SRAM_K, REG_M, REG_N, REG_K>,
+        test_kernel(sgemm_reg_f32_kernel_old<SRAM_M, SRAM_N, SRAM_K, REG_M, REG_N, REG_K>,
                     "Registers", d_A, d_B, d_C, M, N, K, grid_blocks, block_threads);
+
+        // 验证正确性
+        CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+        float max_err = 0;
+        for (int i = 0; i < M * N; ++i)
+            max_err = fmax(max_err, fabs(h_C[i] - h_ref[i]));
+        std::cout << "  Max Error: " << max_err << "\n\n";
+    }
+
+    // 测试寄存器优化版本
+    {
+        constexpr int SRAM_M = 32, SRAM_N = 32, SRAM_K = 32;
+        constexpr int REG_M = 4, REG_N = 4;
+        dim3 block_threads(SRAM_N / REG_N, SRAM_M / REG_M); 
+        dim3 grid_blocks((N + SRAM_N - 1) / SRAM_N, (M + SRAM_M - 1) / SRAM_M);
+
+        test_kernel(sgemm_reg_f32_kernel<SRAM_M, SRAM_N, SRAM_K, REG_M, REG_N>,
+                    "Registers_new", d_A, d_B, d_C, M, N, K, grid_blocks, block_threads);
 
         // 验证正确性
         CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
