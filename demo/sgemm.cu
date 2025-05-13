@@ -45,6 +45,8 @@ __global__ void sgemm_block_tile_naive_v1(float *a, float* b, float* c, int M, i
     __shared__ float smem_a[BLOCK_TILE_M][BLOCK_TILE_K];
     __shared__ float smem_b[BLOCK_TILE_K][BLOCK_TILE_N];
 
+    float acc = 0.0f;  
+
     for (int k_outter = 0; k_outter < K; k_outter += BLOCK_TILE_K) {
         int global_row_a = by * BLOCK_TILE_M;
         int global_col_a = k_outter;
@@ -68,24 +70,20 @@ __global__ void sgemm_block_tile_naive_v1(float *a, float* b, float* c, int M, i
             }
         }
         __syncthreads();
-
-        int global_row_c = by * BLOCK_TILE_M;
-        int global_col_c = bx * BLOCK_TILE_N;
         
         for (int m = ty; m < BLOCK_TILE_M; m += blockDim.y) {
             for (int n = tx; n < BLOCK_TILE_N; n += blockDim.x) {
-                float acc = 0.0f;
                 for (int k = 0; k < BLOCK_TILE_K; k++) {
                     acc += smem_a[m][k] * smem_b[k][n];
                 }
-                int row = global_row_c + m;
-                int col = global_col_c + n;
+                int row = by * BLOCK_TILE_M + m;
+                int col = bx * BLOCK_TILE_N + n;
                 if (row < M && col < N) {
-                    float old = (k_outter == 0) ? 0.0f : c[row * N + col];
-                    c[row * N + col] = old + acc;
-                }
+                    c[row * N + col] = acc;
+                }  
             }
         }
+        __syncthreads();
     }
 }
 
@@ -275,6 +273,108 @@ __global__ void sgemm_thread_tile_coalesced_access_v3(float *a, float *b, float 
     }    
 }
 
+template <
+    const int BLOCK_TILE_M,
+    const int BLOCK_TILE_N,
+    const int BLOCK_TILE_K,
+    const int THREAD_TILE_M,
+    const int THREAD_TILE_N
+>
+__global__ void sgemm_optimized(float *__restrict__ a, 
+                                float *__restrict__ b,
+                                float *__restrict__ c,
+                                int M, int N, int K) {
+    const int bx = blockIdx.x, by = blockIdx.y;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+
+    constexpr int THREADS_X = BLOCK_TILE_N / THREAD_TILE_N;
+    constexpr int THREADS_Y = BLOCK_TILE_M / THREAD_TILE_M;
+    constexpr int THREADS_PER_BLOCK = THREADS_X * THREADS_Y;
+
+    __shared__ float smem_a[BLOCK_TILE_M * BLOCK_TILE_K]; // 行主序
+    __shared__ float smem_b[BLOCK_TILE_K * BLOCK_TILE_N]; // 注意此处维度顺序！行主序存储B转置
+
+    float reg_c[THREAD_TILE_M][THREAD_TILE_N] = {0.0f};
+
+    // 线程在线程块内的一维线性id
+    const int thread_id = ty * THREADS_X + tx;
+
+    // 每线程加载共享内存A的数量
+    constexpr int ELEMS_PER_THREAD_A = (BLOCK_TILE_M * BLOCK_TILE_K) / THREADS_PER_BLOCK;
+    constexpr int ELEMS_PER_THREAD_B = (BLOCK_TILE_K * BLOCK_TILE_N) / THREADS_PER_BLOCK;
+
+    for (int k_outer = 0; k_outer < K; k_outer += BLOCK_TILE_K) {
+        // ==== 加载A到共享内存 ====
+        for (int i = 0; i < ELEMS_PER_THREAD_A; ++i) {
+            int idx = thread_id * ELEMS_PER_THREAD_A + i;
+            int row = idx / BLOCK_TILE_K;
+            int col = idx % BLOCK_TILE_K;
+            int global_row = by * BLOCK_TILE_M + row;
+            int global_col = k_outer + col;
+            if (global_row < M && global_col < K) {
+                smem_a[row * BLOCK_TILE_K + col] = a[global_row * K + global_col];
+            } else {
+                smem_a[row * BLOCK_TILE_K + col] = 0.0f;
+            }
+        }
+
+        // ==== 加载B到共享内存（转置后再存）====
+        for (int i = 0; i < ELEMS_PER_THREAD_B; ++i) {
+            int idx = thread_id * ELEMS_PER_THREAD_B + i;
+            int row = idx / BLOCK_TILE_N;
+            int col = idx % BLOCK_TILE_N;
+            int global_row = k_outer + row;
+            int global_col = bx * BLOCK_TILE_N + col;
+            if (global_row < K && global_col < N) {
+                smem_b[row * BLOCK_TILE_N + col] = b[global_row * N + global_col];
+            } else {
+                smem_b[row * BLOCK_TILE_N + col] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // ==== 计算子块的乘积 ====
+        for (int k_inner = 0; k_inner < BLOCK_TILE_K; ++k_inner) {
+            float reg_a[THREAD_TILE_M];
+            float reg_b[THREAD_TILE_N];
+
+            // 每个线程加载一行A（BLOCK_TILE_M x BLOCK_TILE_K）
+            for (int m = 0; m < THREAD_TILE_M; ++m) {
+                int row = ty * THREAD_TILE_M + m;
+                reg_a[m] = smem_a[row * BLOCK_TILE_K + k_inner];
+            }
+
+            // 每个线程加载一列B（BLOCK_TILE_K x BLOCK_TILE_N）
+            for (int n = 0; n < THREAD_TILE_N; ++n) {
+                int col = tx * THREAD_TILE_N + n;
+                reg_b[n] = smem_b[k_inner * BLOCK_TILE_N + col]; // 注意转置后的访问顺序
+            }
+
+            // Outer-product accumulation
+            for (int m = 0; m < THREAD_TILE_M; ++m) {
+                for (int n = 0; n < THREAD_TILE_N; ++n) {
+                    reg_c[m][n] += reg_a[m] * reg_b[n];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // ==== 写回到全局内存 ====
+    for (int m = 0; m < THREAD_TILE_M; ++m) {
+        int global_row = by * BLOCK_TILE_M + ty * THREAD_TILE_M + m;
+        if (global_row >= M) continue;
+        for (int n = 0; n < THREAD_TILE_N; ++n) {
+            int global_col = bx * BLOCK_TILE_N + tx * THREAD_TILE_N + n;
+            if (global_col < N) {
+                c[global_row * N + global_col] = reg_c[m][n];
+            }
+        }
+    }
+}
+
 void cpu_sgemm(float *a, float* b, float* c, int M, int N, int K) {
     for (int m = 0; m < M; m++) {
         for (int n = 0; n < N; n++) {
@@ -305,9 +405,9 @@ void test_result(float*a, float* b, float* c, int M, int N, int K) {
     std::cout << "Max difference: " << max_diff << std::endl;
     free(cpu_c);
 }
-
+                 
 int main() {
-    int M = 1024, N = 1024, K = 516;
+    int M = 2048, N = 2048, K = 1024;
 
     // host malloc
     float* a = (float* )malloc(sizeof(float) * M * K);
@@ -338,49 +438,49 @@ int main() {
     cudaMalloc(&b_d, sizeof(float) * K * N);
     cudaMalloc(&c_d, sizeof(float) * M * N);
 
+    // {
+    //     // copy from host to device
+    //     cudaMemcpy(a_d, a, sizeof(float) * M * K, cudaMemcpyHostToDevice);
+    //     cudaMemcpy(b_d, b, sizeof(float) * K * N, cudaMemcpyHostToDevice);
+
+    //     // compute
+    //     dim3 block(16, 16);
+    //     dim3 grid((N + 16 - 1) / 16, (M + 16 - 1) / 16);
+    //     sgemm_naive_v0<<<grid, block>>>(a_d, b_d, c_d, M, N, K);
+
+    //     // write back
+    //     cudaMemcpy(c, c_d, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+
+    //     // check
+    //     test_result(a, b, c, M, N, K);
+    // }
+
+    // {
+    //     // copy from host to device
+    //     cudaMemcpy(a_d, a, sizeof(float) * M * K, cudaMemcpyHostToDevice);
+    //     cudaMemcpy(b_d, b, sizeof(float) * K * N, cudaMemcpyHostToDevice);
+
+    //     // compute
+    //     dim3 block(16, 16);
+    //     dim3 grid((N + 16 - 1) / 16, (M + 16 - 1) / 16);
+    //     sgemm_block_tile_naive_v1<16, 16, 16><<<grid, block>>>(a_d, b_d, c_d, M, N, K);
+
+    //     // write back
+    //     cudaMemcpy(c, c_d, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+
+    //     // check
+    //     test_result(a, b, c, M, N, K);
+    // }
+
     {
         // copy from host to device
         cudaMemcpy(a_d, a, sizeof(float) * M * K, cudaMemcpyHostToDevice);
         cudaMemcpy(b_d, b, sizeof(float) * K * N, cudaMemcpyHostToDevice);
 
         // compute
-        dim3 block(16, 16);
-        dim3 grid((N + 16 - 1) / 16, (M + 16 - 1) / 16);
-        sgemm_naive_v0<<<grid, block>>>(a_d, b_d, c_d, M, N, K);
-
-        // write back
-        cudaMemcpy(c, c_d, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
-
-        // check
-        test_result(a, b, c, M, N, K);
-    }
-
-    {
-        // copy from host to device
-        cudaMemcpy(a_d, a, sizeof(float) * M * K, cudaMemcpyHostToDevice);
-        cudaMemcpy(b_d, b, sizeof(float) * K * N, cudaMemcpyHostToDevice);
-
-        // compute
-        dim3 block(16, 16);
-        dim3 grid((N + 16 - 1) / 16, (M + 16 - 1) / 16);
-        sgemm_block_tile_naive_v1<16, 16, 16><<<grid, block>>>(a_d, b_d, c_d, M, N, K);
-
-        // write back
-        cudaMemcpy(c, c_d, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
-
-        // check
-        test_result(a, b, c, M, N, K);
-    }
-
-    {
-        // copy from host to device
-        cudaMemcpy(a_d, a, sizeof(float) * M * K, cudaMemcpyHostToDevice);
-        cudaMemcpy(b_d, b, sizeof(float) * K * N, cudaMemcpyHostToDevice);
-
-        // compute
-        const int BLOCK_TILE_M = 16;
-        const int BLOCK_TILE_N = 16;
-        const int BLOCK_TILE_K = 16;
+        const int BLOCK_TILE_M = 64;
+        const int BLOCK_TILE_N = 64;
+        const int BLOCK_TILE_K = 64;
         const int THREAD_TILE_M = 4;
         const int THREAD_TILE_N = 4;
 
@@ -401,15 +501,38 @@ int main() {
         cudaMemcpy(b_d, b, sizeof(float) * K * N, cudaMemcpyHostToDevice);
 
         // compute
-        const int BLOCK_TILE_M = 16;
-        const int BLOCK_TILE_N = 16;
-        const int BLOCK_TILE_K = 16;
+        const int BLOCK_TILE_M = 64;
+        const int BLOCK_TILE_N = 64;
+        const int BLOCK_TILE_K = 64;
         const int THREAD_TILE_M = 4;
         const int THREAD_TILE_N = 4;
 
         dim3 block(BLOCK_TILE_N / THREAD_TILE_N, BLOCK_TILE_M / THREAD_TILE_M);
         dim3 grid((N + BLOCK_TILE_N - 1) / BLOCK_TILE_N, (M + BLOCK_TILE_M - 1) / BLOCK_TILE_M);
         sgemm_thread_tile_coalesced_access_v3<BLOCK_TILE_M, BLOCK_TILE_N, BLOCK_TILE_K, THREAD_TILE_M, THREAD_TILE_N><<<grid, block>>>(a_d, b_d, c_d, M, N, K);
+
+        // write back
+        cudaMemcpy(c, c_d, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+
+        // check
+        test_result(a, b, c, M, N, K);
+    }
+
+    {
+        // copy from host to device
+        cudaMemcpy(a_d, a, sizeof(float) * M * K, cudaMemcpyHostToDevice);
+        cudaMemcpy(b_d, b, sizeof(float) * K * N, cudaMemcpyHostToDevice);
+
+        // compute
+        const int BLOCK_TILE_M = 64;
+        const int BLOCK_TILE_N = 64;
+        const int BLOCK_TILE_K = 64;
+        const int THREAD_TILE_M = 4;
+        const int THREAD_TILE_N = 4;
+
+        dim3 block(BLOCK_TILE_N / THREAD_TILE_N, BLOCK_TILE_M / THREAD_TILE_M);
+        dim3 grid((N + BLOCK_TILE_N - 1) / BLOCK_TILE_N, (M + BLOCK_TILE_M - 1) / BLOCK_TILE_M);
+        sgemm_optimized<BLOCK_TILE_M, BLOCK_TILE_N, BLOCK_TILE_K, THREAD_TILE_M, THREAD_TILE_N><<<grid, block>>>(a_d, b_d, c_d, M, N, K);
 
         // write back
         cudaMemcpy(c, c_d, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
