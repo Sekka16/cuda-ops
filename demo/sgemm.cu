@@ -208,6 +208,7 @@ __global__ void sgemm_thread_tile_coalesced_access_v3(float *a, float *b, float 
 
         int global_row_a = by * BLOCK_TILE_M + ty * LOAD_A_M_PER_THREAD;
         int global_col_a = k_outter + tx * LOAD_A_K_PER_THREAD;
+
         int shared_row_a = ty * LOAD_A_M_PER_THREAD;
         int shared_col_a = tx * LOAD_A_K_PER_THREAD;
 
@@ -224,6 +225,7 @@ __global__ void sgemm_thread_tile_coalesced_access_v3(float *a, float *b, float 
 
         int global_row_b = k_outter + ty * LOAD_B_K_PER_THREAD;
         int global_col_b = bx * BLOCK_TILE_N + tx * LOAD_B_N_PER_THREAD;
+
         int shared_row_b = ty * LOAD_B_K_PER_THREAD;
         int shared_col_b = tx * LOAD_B_N_PER_THREAD;
 
@@ -280,91 +282,85 @@ template <
     const int THREAD_TILE_M,
     const int THREAD_TILE_N
 >
-__global__ void sgemm_optimized(float *__restrict__ a, 
-                                float *__restrict__ b,
-                                float *__restrict__ c,
-                                int M, int N, int K) {
-    const int bx = blockIdx.x, by = blockIdx.y;
-    const int tx = threadIdx.x, ty = threadIdx.y;
+__global__ void sgemm_one_dim_tid_access_v4(float *a, float *b, float *c, int M, int N, int K) {
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
 
-    constexpr int THREADS_X = BLOCK_TILE_N / THREAD_TILE_N;
-    constexpr int THREADS_Y = BLOCK_TILE_M / THREAD_TILE_M;
-    constexpr int THREADS_PER_BLOCK = THREADS_X * THREADS_Y;
+    __shared__ float smem_a[BLOCK_TILE_M][BLOCK_TILE_K];
+    __shared__ float smem_b[BLOCK_TILE_K][BLOCK_TILE_N];
 
-    __shared__ float smem_a[BLOCK_TILE_M * BLOCK_TILE_K]; // 行主序
-    __shared__ float smem_b[BLOCK_TILE_K * BLOCK_TILE_N]; // 注意此处维度顺序！行主序存储B转置
+    float reg_c[THREAD_TILE_M][THREAD_TILE_N] = {0};
+    float reg_a[THREAD_TILE_M];
+    float reg_b[THREAD_TILE_N];
 
-    float reg_c[THREAD_TILE_M][THREAD_TILE_N] = {0.0f};
+    const int THREAD_Y_PER_BLOCK = BLOCK_TILE_M / THREAD_TILE_M;
+    const int THREAD_X_PER_BLOCK = BLOCK_TILE_N / THREAD_TILE_N;
+    const int THREAD_NUMS = THREAD_Y_PER_BLOCK * THREAD_X_PER_BLOCK;
 
-    // 线程在线程块内的一维线性id
-    const int thread_id = ty * THREADS_X + tx;
-
-    // 每线程加载共享内存A的数量
-    constexpr int ELEMS_PER_THREAD_A = (BLOCK_TILE_M * BLOCK_TILE_K) / THREADS_PER_BLOCK;
-    constexpr int ELEMS_PER_THREAD_B = (BLOCK_TILE_K * BLOCK_TILE_N) / THREADS_PER_BLOCK;
+    int tid = ty * THREAD_X_PER_BLOCK + tx;
 
     for (int k_outer = 0; k_outer < K; k_outer += BLOCK_TILE_K) {
-        // ==== 加载A到共享内存 ====
-        for (int i = 0; i < ELEMS_PER_THREAD_A; ++i) {
-            int idx = thread_id * ELEMS_PER_THREAD_A + i;
-            int row = idx / BLOCK_TILE_K;
-            int col = idx % BLOCK_TILE_K;
+        // Load A tile
+        for (int i = tid; i < BLOCK_TILE_M * BLOCK_TILE_K; i += THREAD_NUMS) {
+            int row = i / BLOCK_TILE_K;
+            int col = i % BLOCK_TILE_K;
             int global_row = by * BLOCK_TILE_M + row;
             int global_col = k_outer + col;
-            smem_a[row * BLOCK_TILE_K + col] = (global_row < M && global_col < N) ? a[global_row * K + global_col] : 0.0f;
+            if (global_row < M && global_col < K) {
+                smem_a[row][col] = a[global_row * K + global_col];
+            } else {
+                smem_a[row][col] = 0.0f;
+            }
         }
 
-        // ==== 加载B到共享内存（转置后再存）====
-        for (int i = 0; i < ELEMS_PER_THREAD_B; ++i) {
-            int idx = thread_id * ELEMS_PER_THREAD_B + i;
-            int row = idx / BLOCK_TILE_N;
-            int col = idx % BLOCK_TILE_N;
+        // Load B tile
+        for (int i = tid; i < BLOCK_TILE_K * BLOCK_TILE_N; i += THREAD_NUMS) {
+            int row = i / BLOCK_TILE_N;
+            int col = i % BLOCK_TILE_N;
             int global_row = k_outer + row;
             int global_col = bx * BLOCK_TILE_N + col;
-            smem_b[row * BLOCK_TILE_N + col] = (global_row < K && global_col < N) ? b[global_row * N + global_col] : 0.0f;
+            if (global_row < K && global_col < N) {
+                smem_b[row][col] = b[global_row * N + global_col];
+            } else {
+                smem_b[row][col] = 0.0f;
+            }
         }
-
         __syncthreads();
-
-        // ==== 计算子块的乘积 ====
-        for (int k_inner = 0; k_inner < BLOCK_TILE_K; ++k_inner) {
-            float reg_a[THREAD_TILE_M];
-            float reg_b[THREAD_TILE_N];
-
-            // 每个线程加载一行A（BLOCK_TILE_M x BLOCK_TILE_K）
-            for (int m = 0; m < THREAD_TILE_M; ++m) {
-                int row = ty * THREAD_TILE_M + m;
-                reg_a[m] = smem_a[row * BLOCK_TILE_K + k_inner];
+        for (int k_inner = 0; k_inner < BLOCK_TILE_K; k_inner++) {
+            int shared_row_a = ty * THREAD_TILE_M;
+            for (int m = 0; m < THREAD_TILE_M; m++) {
+                int row = shared_row_a + m;
+                int col = k_inner;
+                reg_a[m] = smem_a[row][col];
             }
 
-            // 每个线程加载一列B（BLOCK_TILE_K x BLOCK_TILE_N）
-            for (int n = 0; n < THREAD_TILE_N; ++n) {
-                int col = tx * THREAD_TILE_N + n;
-                reg_b[n] = smem_b[k_inner * BLOCK_TILE_N + col]; // 注意转置后的访问顺序
+            int shared_col_b = tx * THREAD_TILE_N;
+            for (int n = 0; n < THREAD_TILE_N; n++) {
+                int row = k_inner;
+                int col = shared_col_b + n;
+                reg_b[n] = smem_b[row][col];
             }
-
-            // Outer-product accumulation
-            for (int m = 0; m < THREAD_TILE_M; ++m) {
-                for (int n = 0; n < THREAD_TILE_N; ++n) {
+            
+            for (int m = 0; m < THREAD_TILE_M; m++) {
+                for (int n = 0; n < THREAD_TILE_N; n++) {
                     reg_c[m][n] += reg_a[m] * reg_b[n];
                 }
             }
         }
-
         __syncthreads();
     }
+    int global_row_c = by * BLOCK_TILE_M + ty * THREAD_TILE_M;
+    int global_col_c = bx * BLOCK_TILE_N + tx * THREAD_TILE_N;
 
-    // ==== 写回到全局内存 ====
-    for (int m = 0; m < THREAD_TILE_M; ++m) {
-        int global_row = by * BLOCK_TILE_M + ty * THREAD_TILE_M + m;
-        if (global_row >= M) continue;
-        for (int n = 0; n < THREAD_TILE_N; ++n) {
-            int global_col = bx * BLOCK_TILE_N + tx * THREAD_TILE_N + n;
-            if (global_col < N) {
-                c[global_row * N + global_col] = reg_c[m][n];
+    for (int m = 0; m < THREAD_TILE_M; m++) {
+        for (int n = 0; n < THREAD_TILE_N; n++) {
+            int row = global_row_c + m;
+            int col = global_col_c + n;
+            if (row < M && col < N) {
+                c[row * N + col] = reg_c[m][n];
             }
         }
-    }
+    }    
 }
 
 void cpu_sgemm(float *a, float* b, float* c, int M, int N, int K) {
@@ -562,7 +558,7 @@ int main() {
 
         dim3 block(BLOCK_TILE_N / THREAD_TILE_N, BLOCK_TILE_M / THREAD_TILE_M);
         dim3 grid((N + BLOCK_TILE_N - 1) / BLOCK_TILE_N, (M + BLOCK_TILE_M - 1) / BLOCK_TILE_M);
-        sgemm_optimized<BLOCK_TILE_M, BLOCK_TILE_N, BLOCK_TILE_K, THREAD_TILE_M, THREAD_TILE_N><<<grid, block>>>(a_d, b_d, c_d, M, N, K);
+        sgemm_one_dim_tid_access_v4<BLOCK_TILE_M, BLOCK_TILE_N, BLOCK_TILE_K, THREAD_TILE_M, THREAD_TILE_N><<<grid, block>>>(a_d, b_d, c_d, M, N, K);
 
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
@@ -580,7 +576,6 @@ int main() {
         // check
         // test_result(a, b, c, M, N, K);
     }
-
 
     // free
     free(a);
